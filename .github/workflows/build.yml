@@ -1,0 +1,262 @@
+name: Build GKI Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Cleanup / Free disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc build-essential curl python3 libssl-dev flex bison libelf-dev rsync zip aria2 pigz
+
+      - name: Setup swap
+        run: |
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1G count=16 status=progress
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h .
+
+      - name: Download manifest.xml for branch (with deprecated fallback)
+        run: |
+          WORKSPACE="$GITHUB_WORKSPACE/gki_kernel"
+          mkdir -p "$WORKSPACE"
+          cd "$WORKSPACE"
+
+          ANDROID_VERSION="android12"
+          KERNEL_VERSION="5.10"
+          OS_PATCH_LEVEL="2025-06"
+          FORMATTED_BRANCH="${ANDROID_VERSION}-${KERNEL_VERSION}-${OS_PATCH_LEVEL}"
+
+          MAIN_MANIFEST_URL="https://android.googlesource.com/kernel/manifest/+/refs/heads/common-${FORMATTED_BRANCH}/default.xml?format=TEXT"
+          DEPRECATED_MANIFEST_URL="https://android.googlesource.com/kernel/manifest/+/refs/heads/deprecated/common-${FORMATTED_BRANCH}/default.xml?format=TEXT"
+
+          echo "Trying to fetch manifest from $MAIN_MANIFEST_URL"
+          if curl -fsSL "$MAIN_MANIFEST_URL" | base64 -d > manifest.xml; then
+            echo "Fetched manifest from $MAIN_MANIFEST_URL"
+          else
+            echo "Main manifest fetch failed, trying deprecated branch."
+            echo "⚠ Note: Branch common-${FORMATTED_BRANCH} is considered deprecated."
+            if curl -fsSL "$DEPRECATED_MANIFEST_URL" | base64 -d > manifest.xml; then
+              echo "Fetched manifest from $DEPRECATED_MANIFEST_URL"
+            else
+              echo "ERROR: Neither main nor deprecated branch exists for $FORMATTED_BRANCH" >&2
+              exit 22
+            fi
+          fi
+
+      - name: Debug Show manifest.xml
+        run: cat "$GITHUB_WORKSPACE/gki_kernel/manifest.xml"
+
+      - name: Write fast parallel download script
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.scripts"
+          cat > "$GITHUB_WORKSPACE/.scripts/fast_parallel_download.py" << 'PYEOF'
+          #!/usr/bin/env python3
+          import xml.etree.ElementTree as ET
+          import subprocess
+          import os
+          import shutil
+          from concurrent.futures import ThreadPoolExecutor
+          import traceback
+          import time
+          import sys
+
+
+          def try_download(url, name):
+              aria_cmd = f"aria2c -x16 -s16 -k1M -j5 --file-allocation=none -o {name}.tar.gz '{url}'"
+              print(f"  Trying download: {url}")
+              result = subprocess.run(aria_cmd, shell=True)
+              if result.returncode == 0:
+                  return True
+              print(f"  Download failed, retrying in 10 seconds...")
+              time.sleep(10)
+              result = subprocess.run(aria_cmd, shell=True)
+              return result.returncode == 0
+
+
+          def sync_project(task):
+              name, path, url, strip, rev, linkfiles, copyfiles = task
+              if path not in ["./", "."]:
+                  os.makedirs(path, exist_ok=True)
+              print(f"Syncing: {name} -> {path}")
+              print(f"  Download URL: {url}")
+              try:
+                  downloaded = False
+                  if "googlesource.com" in url:
+                      downloaded = try_download(url, name)
+                      if not downloaded:
+                          if "+archive/" in url:
+                              parts = url.split("+archive/")
+                              branch = parts[1].split(".tar.gz")[0]
+                              dep_url = f"{parts[0]}+archive/deprecated/{branch}.tar.gz"
+                              print(f"  Main branch failed, trying deprecated branch: {dep_url}")
+                              downloaded = try_download(dep_url, name)
+                  else:
+                      downloaded = try_download(url, name)
+
+                  if not downloaded:
+                      print(f"Failed to download {name} from all attempted URLs.")
+                      return False
+
+                  nproc = int(subprocess.check_output("nproc", shell=True).strip() or 1)
+                  tar_cmd = f"tar -I 'pigz -p {nproc} -b 256' -x --record-size=1M -C {path} {strip} -f {name}.tar.gz"
+                  subprocess.run(tar_cmd, shell=True, check=True)
+                  os.remove(f"{name}.tar.gz")
+
+                  top_dir = os.getcwd()
+                  for src_rel, dest_rel in linkfiles:
+                      src_path = os.path.join(top_dir, path, src_rel)
+                      dest_path = os.path.join(top_dir, dest_rel)
+                      os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                      if os.path.lexists(dest_path):
+                          os.remove(dest_path)
+                      rel_target = os.path.relpath(src_path, os.path.dirname(dest_path))
+                      os.symlink(rel_target, dest_path)
+                      print(f"  [Link] {dest_rel} -> {src_rel}")
+                  for src_rel, dest_rel in copyfiles:
+                      src_path = os.path.join(top_dir, path, src_rel)
+                      dest_path = os.path.join(top_dir, dest_rel)
+                      os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                      shutil.copy2(src_path, dest_path)
+                      print(f"  [Copy] {dest_rel} from {src_rel}")
+                  print(f"Synced {name} successfully!")
+                  return True
+              except Exception as e:
+                  print(f"Failed to sync {name}: {e}")
+                  traceback.print_exc()
+                  return False
+
+
+          def main(manifest_path='manifest.xml'):
+              if not os.path.exists(manifest_path):
+                  print(f"ERROR: manifest file not found: {manifest_path}")
+                  return 2
+
+              with open(manifest_path, 'r') as f:
+                  manifest_content = f.read()
+              root = ET.fromstring(manifest_content)
+
+              remotes = {}
+              for r in root.findall('remote'):
+                  fetch = (r.get('fetch') or '').rstrip('/')
+                  if fetch == '..':
+                      fetch = 'https://android.googlesource.com'
+                  remotes[r.get('name')] = fetch
+              default = root.find('default')
+              def_remote = default.get('remote') if default is not None else None
+              def_rev = default.get('revision') if default is not None else None
+
+              sync_tasks = []
+              for project in root.findall('project'):
+                  name = project.get('name')
+                  path = project.get('path', name)
+                  remote_name = project.get('remote', def_remote)
+                  rev = project.get('revision', def_rev)
+                  base_url = remotes.get(remote_name)
+                  if not base_url:
+                      continue
+                  if "github.com" in base_url:
+                      url = f"{base_url}/{name}/archive/{rev}.tar.gz"
+                      strip = "--strip-components=1"
+                  elif "googlesource.com" in base_url:
+                      url = f"{base_url}/{name}/+archive/{rev}.tar.gz"
+                      strip = ""
+                  elif "git.codelinaro.org" in base_url:
+                      url = f"{base_url}/{name}/-/archive/{rev}.tar.gz"
+                      strip = "--strip-components=1"
+                  else:
+                      continue
+                  linkfiles = [(lf.get('src'), lf.get('dest')) for lf in project.findall('linkfile')]
+                  copyfiles = [(cf.get('src'), cf.get('dest')) for cf in project.findall('copyfile')]
+                  sync_tasks.append((name, path, url, strip, rev, linkfiles, copyfiles))
+
+              print(f"Found {len(sync_tasks)} projects to sync.")
+
+              max_workers = (os.cpu_count() or 2) * 4
+              with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                  results = list(executor.map(sync_project, sync_tasks))
+
+              if not all(results):
+                  print("One or more projects failed to sync!")
+                  return 1
+              return 0
+
+
+          if __name__ == '__main__':
+              rc = main()
+              sys.exit(rc)
+          PYEOF
+
+      - name: Fast Parallel Archive Download
+        working-directory: ${{ github.workspace }}/gki_kernel
+        run: |
+          python3 "$GITHUB_WORKSPACE/.scripts/fast_parallel_download.py"
+
+      - name: Build GKI kernel
+        run: |
+          WORKSPACE="$GITHUB_WORKSPACE/gki_kernel"
+          cd "$WORKSPACE"
+          export LTO=full
+          BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+
+      - name: Collect kernel image
+        run: |
+          WORKSPACE="$GITHUB_WORKSPACE/gki_kernel"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          OUT_DIR="$WORKSPACE/out/android12-5.10/dist"
+          if [[ -d "$OUT_DIR" ]]; then
+            cp "$OUT_DIR"/* "$GITHUB_WORKSPACE/artifacts/" 2>/dev/null || true
+          else
+            echo "Dist output directory not found at $OUT_DIR"
+            exit 1
+          fi
+
+          if [[ ! -f "$OUT_DIR/Image" ]]; then
+            echo "Image not found in $OUT_DIR"
+            exit 1
+          fi
+
+      - name: Pack with AnyKernel3
+        run: |
+          OUT_DIR="$GITHUB_WORKSPACE/gki_kernel/out/android12-5.10/dist"
+
+          git clone --depth=1 https://github.com/DikyVinus/AnyKernel3.git "$GITHUB_WORKSPACE/AnyKernel3"
+          cd "$GITHUB_WORKSPACE/AnyKernel3"
+
+          cp "$OUT_DIR/Image" .
+
+          ZIP_NAME="AnyKernel3-GKI-$(date +'%Y%m%d-%H%M').zip"
+          zip -r9 "$GITHUB_WORKSPACE/artifacts/$ZIP_NAME" . -x '.git*'
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kernel-aarch64
+          path: artifacts/*
+
+      - name: Set release tag
+        id: tag
+        run: echo "tag=gki-kernel-$(date +'%Y%m%d-%H%M')" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "GKI Kernel ${{ steps.tag.outputs.tag }}"
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
