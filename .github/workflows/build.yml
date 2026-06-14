@@ -1,4 +1,4 @@
-name: Build GKI Kernel
+name: Build INOI A750 Kernel
 
 on:
   workflow_dispatch:
@@ -41,7 +41,7 @@ jobs:
       - name: Sync kernel source
         env:
           GKI_MANIFEST_BRANCH: common-android12-5.10
-          GKI_TAG: android12-5.10-2025-06_r6
+          GKI_BRANCH: android12-5.10-2025-06
           SYNC_JOBS: "4"
         run: |
           set -euo pipefail
@@ -68,15 +68,6 @@ jobs:
             --quiet \
             "${init_flags[@]}"
 
-          local_manifest_src="$GITHUB_WORKSPACE/.github/manifests/minimal/${GKI_MANIFEST_BRANCH}.xml"
-          if [ ! -f "$local_manifest_src" ]; then
-            echo "::error::missing minimal manifest: $local_manifest_src"
-            exit 1
-          fi
-
-          mkdir -p .repo/local_manifests
-          cp "$local_manifest_src" .repo/local_manifests/minimal.xml
-
           sync_jobs="${SYNC_JOBS:-4}"
 
           if ! repo sync \
@@ -94,10 +85,34 @@ jobs:
               -j"${sync_jobs}"
           fi
 
-          echo "== pinning common to $GKI_TAG =="
-          cd common
-          git fetch origin tag "$GKI_TAG"
-          git checkout "$GKI_TAG"
+          echo "== pinning common to latest respin of $GKI_BRANCH (stays at 5.10.237) =="
+
+          common_rel="$(
+            repo list 2>/dev/null |
+              awk -F' : ' '$2 == "kernel/common" { print $1; exit }'
+          )"
+          common_rel="${common_rel:-common}"
+
+          if [ ! -d "$common_rel" ]; then
+            echo "::error::kernel/common project not found at expected path '$common_rel'"
+            echo "== repo list output for debugging =="
+            repo list 2>/dev/null
+            exit 1
+          fi
+
+          echo "kernel/common resolved to: $common_rel"
+          cd "$common_rel"
+
+          remote_name="$(git remote | head -n1)"
+          if [ -z "$remote_name" ]; then
+            echo "::error::no git remote configured in $common_rel"
+            git remote -v
+            exit 1
+          fi
+          echo "using remote: $remote_name"
+
+          git fetch "$remote_name" "$GKI_BRANCH"
+          git checkout FETCH_HEAD
           cd ..
 
       - name: Build GKI kernel
@@ -124,6 +139,48 @@ jobs:
             echo "Image not found in $OUT_DIR"
             exit 1
           fi
+
+      - name: Build and sign boot.img
+        env:
+          AVB_SIGNING_KEY: ${{ secrets.AVB_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="$GITHUB_WORKSPACE/kernel/out/android12-5.10/dist"
+
+          # mkbootimg/unpack_bootimg from AOSP, and avbtool from external/avb
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg "$GITHUB_WORKSPACE/mkbootimg"
+          git clone --depth=1 https://android.googlesource.com/platform/external/avb "$GITHUB_WORKSPACE/avb"
+
+          # Ramdisk extracted from stock boot.img (header v4, INOI A75)
+          mkdir -p "$GITHUB_WORKSPACE/boot_unpack"
+          cp "$GITHUB_WORKSPACE/.github/bootimg/ramdisk" "$GITHUB_WORKSPACE/boot_unpack/ramdisk"
+
+          python3 "$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" \
+            --header_version 4 \
+            --os_version 12.0.0 \
+            --os_patch_level 2099-12 \
+            --kernel "$OUT_DIR/Image" \
+            --ramdisk "$GITHUB_WORKSPACE/boot_unpack/ramdisk" \
+            --cmdline '' \
+            -o "$GITHUB_WORKSPACE/artifacts/boot.img"
+
+          if [[ -z "${AVB_SIGNING_KEY:-}" ]]; then
+            echo "::warning::AVB_SIGNING_KEY secret not set, skipping AVB signing"
+            exit 0
+          fi
+
+          echo "$AVB_SIGNING_KEY" | base64 -d > "$GITHUB_WORKSPACE/avb_key.pem"
+
+          python3 "$GITHUB_WORKSPACE/avb/avbtool.py" add_hash_footer \
+            --image "$GITHUB_WORKSPACE/artifacts/boot.img" \
+            --partition_name boot \
+            --partition_size 67108864 \
+            --key "$GITHUB_WORKSPACE/avb_key.pem" \
+            --algorithm SHA256_RSA2048
+
+          rm -f "$GITHUB_WORKSPACE/avb_key.pem"
+          echo "Signed boot.img with AVB hash footer."
 
       - name: Pack with AnyKernel3
         run: |
